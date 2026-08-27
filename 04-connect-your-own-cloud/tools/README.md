@@ -4,6 +4,7 @@ Self-hosting toolkit. Generates your **own** PKI at runtime — no secrets are s
 
 | Tool | Role |
 |---|---|
+| `ble_scan.py` | Scans for BLE devices whose name starts with `OBI-` |
 | `fetch_tea_key.py` | Get the device TEA key from the cloud: **email + password + BLE name → key** (stdlib only) |
 | `gen_certs.py` | One-shot PKI: CA, server cert, claim cert, permanent ("consistent") cert + `ble_config.json` |
 | `mqtts_server.py` | Minimal MQTTS broker (TLS 8883): emulates AWS-IoT fleet provisioning, logs everything, and can push downlinks — `--set-interval N` (reader upload rate) and `--ota-firmware fw.bin` (flash an image) |
