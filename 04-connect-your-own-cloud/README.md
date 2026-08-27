@@ -13,8 +13,16 @@ device). There are two ways to get it — the cloud way is the easiest and needs
 
 ### Way 1 — from the cloud (easiest — just needs an OBI login + the BLE name)
 
-You only need **three things**: an OBI account email, its password, and the device's **BLE name** — the
-`OBI-XXXXXX` it advertises (read it with any BLE scanner — it is *not* printed on the device). That name *is* the challenge id.
+You only need **three things**: an OBI account email, its password, and the device's **BLE name**.
+
+After plugging in the new device or pressing the button on the Bride for two seconds the Bluetooth name `OBI-XXXXXX` can be determined with any Scanner or the following script:
+```bash
+python tools/ble_scan.py
+# Scanning for Bluetooth devices for 5 seconds:
+# 34:B7:01:02:03:04: OBI-XXXXXX
+# Found 1 OBI device(s)
+```
+
 The device does **not** have to be registered to your account — any valid OBI login works and the endpoint
 returns the key for whatever `OBI-XXXXXX` you ask for (see [security notes](../03-reverse-engineering/security-notes.md)).
 

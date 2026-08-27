@@ -10,7 +10,13 @@ placeholders — you generate your own. 🇩🇪 **Deutsche Version: [ANLEITUNG.
 - A **machine on the same LAN** (your broker host), port **8883** open.
 - **Python 3** + once: `pip install cryptography bleak paho-mqtt`.
 - Bluetooth on that machine (BLE push) **or** a Web‑Bluetooth browser.
-- The device **BLE name** `OBI-XXXXXX` (read it with any BLE scanner — it is *not* printed on the device).
+
+## Step 0 — get the BLE name
+After plugging in the new device or pressing the button on the Bride for two seconds the Bluetooth name `OBI-XXXXXX` can be determined with any Scanner or the following script:
+```bash
+cd 04-connect-your-own-cloud/tools
+python ble_scan.py
+```
 
 ## Step 1 — get the TEA key (one way is enough)
 ```bash

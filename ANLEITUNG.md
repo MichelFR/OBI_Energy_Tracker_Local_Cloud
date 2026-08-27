@@ -16,10 +16,16 @@ Schritt für Schritt abarbeiten. Alle Keys/Zertifikate hier sind Platzhalter —
   ```
   Diesen MQTT-broker benutzt Du auf Deinem Rechner während der Einrichtung, um vom der Bridge zu lesen / darauf zu schreiben.
 - Bluetooth am Rechner (für den BLE‑Push) **oder** ein Handy/Browser mit Web‑Bluetooth.
-- Den **BLE‑Namen** des Geräts: `OBI-XXXXXX` (mit einem beliebigen BLE‑Scanner auslesen — er steht *nicht* auf dem Gerät).
 - Ein heyObi-Konto **oder** ein UART interface an Deinem Rechner
 
 ---
+
+## Schritt 0 — BLE Namen ermitteln
+Nach einstecken des uneingerichteten Geräts oder Drücken der Taste an der Bridge kann der Bluetooth Name `OBI-XXXXXX` mit einem Scanner oder dem folgenden Script ermittelt werden:
+```bash
+cd 04-connect-your-own-cloud/tools
+python ble_scan.py
+```
 
 ## Schritt 1 — TEA‑Key des Geräts holen
 Der Key verschlüsselt den BLE‑Steuerkanal. **Ein** Weg reicht:
