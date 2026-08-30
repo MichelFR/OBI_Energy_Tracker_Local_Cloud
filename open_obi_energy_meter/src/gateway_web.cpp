@@ -320,6 +320,15 @@ static String readersJson() {
     j += ",\"night_on\":" + String(r.nightTariffOn ? "true" : "false");
     j += ",\"night_start\":" + String(r.nightStartHour) + ",\"night_end\":" + String(r.nightEndHour);
     j += ",\"night_price_cent\":" + (r.nightPriceCent >= 0 ? String(r.nightPriceCent, 2) : String("null"));
+    // §14a HT/ST/NT 3-zone tariff (tariffMode==2) -- raw saved values (not gateway-resolved-with-defaults,
+    // same distinction as the day/night fields above) for the History page's settings-card prefill.
+    j += ",\"tariff_mode\":" + String(r.tariffMode);
+    j += ",\"ht_price_cent\":" + (r.htPriceCent >= 0 ? String(r.htPriceCent, 2) : String("null"));
+    j += ",\"nt_price_cent\":" + (r.ntPriceCent >= 0 ? String(r.ntPriceCent, 2) : String("null"));
+    j += ",\"ht_win\":[" + String(r.htStart[0]) + "," + String(r.htEnd[0]) + "," +
+                            String(r.htStart[1]) + "," + String(r.htEnd[1]) + "]";
+    j += ",\"nt_win\":[" + String(r.ntStart[0]) + "," + String(r.ntEnd[0]) + "," +
+                            String(r.ntStart[1]) + "," + String(r.ntEnd[1]) + "]";
     j += "}";
   }
   return j + "]";
@@ -1086,22 +1095,31 @@ static void handleBoxCfg() {
   else server.send(400, "application/json", "{\"ok\":false}");
 }
 
-// Set part or all of a reader's price / day-night tariff. Partial: only the fields actually present in the
-// request change (starts from the reader's CURRENT saved values, see resolveReaderPrice()'s sibling scan
-// below) -- e.g. the header's price box saves just cent/ecent without touching the separate night-tariff
-// card's settings, and vice versa. No global fallback exists any more: every reader always has its own
-// price, seeded from DEFAULT_PRICE_CENT/DEFAULT_EXPORT_CENT the first time it's ever saved.
+// Set part or all of a reader's price / day-night tariff / §14a HT-ST-NT tariff. Partial: only the fields
+// actually present in the request change (starts from the reader's CURRENT saved values) -- e.g. the
+// header's price box saves just cent/ecent without touching the separate tariff card's settings, and vice
+// versa. No global fallback exists any more: every reader always has its own price, seeded from
+// DEFAULT_PRICE_CENT/DEFAULT_EXPORT_CENT the first time it's ever saved.
+// `mode` (0/1/2) is the single switch between the day/night and HT/ST/NT schemes -- see gw_set_reader_price()
+// in main.cpp. The tariff card always sends its own scheme's fields together with `mode`, but the OTHER
+// scheme's fields are simply left as whatever this reader already had saved (read back below), so switching
+// from mode 1 to 2 and back doesn't lose a previously-entered night window or HT/NT setup.
 static void handleReaderPrice() {
   String id = server.arg("id");
   if (id.length() != 6) { server.send(400, "application/json", "{\"ok\":false}"); return; }
   uint8_t h[3];
   for (int i = 0; i < 3; i++) h[i] = (uint8_t)strtol(id.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
-  float cent = -1, ecent = -1, nprice = -1; bool night = false; int nstart = 22, nend = 6;
+  float cent = -1, ecent = -1, nprice = -1, htprice = -1, ntprice = -1;
+  bool night = false; int nstart = 22, nend = 6, mode = 0;
+  int ht0s = 0, ht0e = 0, ht1s = 0, ht1e = 0, nt0s = 0, nt0e = 0, nt1s = 0, nt1e = 0;
   for (int i = 0; i < MAX_READERS; i++)
     if (readers[i].used && !memcmp(readers[i].handle, h, 3)) {
       Reader &r = readers[i];
       cent = r.priceCentOverride; ecent = r.exportCentOverride;
       night = r.nightTariffOn; nstart = r.nightStartHour; nend = r.nightEndHour; nprice = r.nightPriceCent;
+      mode = r.tariffMode; htprice = r.htPriceCent; ntprice = r.ntPriceCent;
+      ht0s = r.htStart[0]; ht0e = r.htEnd[0]; ht1s = r.htStart[1]; ht1e = r.htEnd[1];
+      nt0s = r.ntStart[0]; nt0e = r.ntEnd[0]; nt1s = r.ntStart[1]; nt1e = r.ntEnd[1];
       break;
     }
   if (server.hasArg("cent")) cent = server.arg("cent").toFloat();
@@ -1110,12 +1128,30 @@ static void handleReaderPrice() {
   if (server.hasArg("nstart")) nstart = server.arg("nstart").toInt();
   if (server.hasArg("nend")) nend = server.arg("nend").toInt();
   if (server.hasArg("nprice")) nprice = server.arg("nprice").toFloat();
+  if (server.hasArg("mode")) mode = server.arg("mode").toInt();
+  if (server.hasArg("htp")) htprice = server.arg("htp").toFloat();
+  if (server.hasArg("ntp")) ntprice = server.arg("ntp").toFloat();
+  if (server.hasArg("ht0s")) ht0s = server.arg("ht0s").toInt();
+  if (server.hasArg("ht0e")) ht0e = server.arg("ht0e").toInt();
+  if (server.hasArg("ht1s")) ht1s = server.arg("ht1s").toInt();
+  if (server.hasArg("ht1e")) ht1e = server.arg("ht1e").toInt();
+  if (server.hasArg("nt0s")) nt0s = server.arg("nt0s").toInt();
+  if (server.hasArg("nt0e")) nt0e = server.arg("nt0e").toInt();
+  if (server.hasArg("nt1s")) nt1s = server.arg("nt1s").toInt();
+  if (server.hasArg("nt1e")) nt1e = server.arg("nt1e").toInt();
   if (cent < 0) cent = -1; else if (cent > 1000) cent = 1000;
   if (ecent < 0) ecent = -1; else if (ecent > 1000) ecent = 1000;
   if (nprice < 0) nprice = -1; else if (nprice > 1000) nprice = 1000;
+  if (htprice < 0) htprice = -1; else if (htprice > 1000) htprice = 1000;
+  if (ntprice < 0) ntprice = -1; else if (ntprice > 1000) ntprice = 1000;
   if (nstart < 0 || nstart > 23) nstart = 22;
   if (nend < 0 || nend > 23) nend = 6;
-  if (gw_set_reader_price(h, cent, ecent, night, (uint8_t)nstart, (uint8_t)nend, nprice))
+  if (mode < 0 || mode > 2) mode = 0;
+  auto h24 = [](int v) -> uint8_t { return (uint8_t)(((v % 24) + 24) % 24); };
+  if (gw_set_reader_price(h, cent, ecent, night, (uint8_t)nstart, (uint8_t)nend, nprice,
+                          (uint8_t)mode, htprice, ntprice,
+                          h24(ht0s), h24(ht0e), h24(ht1s), h24(ht1e),
+                          h24(nt0s), h24(nt0e), h24(nt1s), h24(nt1e)))
     server.send(200, "application/json", "{\"ok\":true}");
   else server.send(400, "application/json", "{\"ok\":false}");
 }
@@ -2786,8 +2822,12 @@ static const float DEFAULT_PRICE_CENT = 31.0f, DEFAULT_EXPORT_CENT = 0.0f;
 static uint32_t hImp[HIST_SLOTS];       // last-logged import per reader slot
 static uint32_t hLastMs[HIST_SLOTS];    // millis() of last sample append (0 = nothing logged yet)
 struct DailyState { uint32_t day = 0, imp = 0, exp = 0;
-  uint32_t dayWh = 0, nightWh = 0;   // this day's import-delta so far, split live by time-of-day (see
-                                      // isNightNow()/historyService() below) -- reset to 0 at each day rollover
+  uint32_t dayWh = 0, nightWh = 0;   // day/night 2-zone split so far (tariffMode==1), live by time-of-day --
+                                      // see isNightNow()/historyService() below. Reset at each day rollover.
+  uint32_t htWh = 0, stWh = 0, ntWh = 0;   // §14a HT/ST/NT 3-zone split so far (tariffMode==2), same idea --
+                                            // see tariffZoneNow()/historyService() below. Mutually exclusive
+                                            // with dayWh/nightWh above: a reader only ever feeds ONE pair,
+                                            // matching its own tariffMode; the other stays 0.
 };
 static DailyState hDaily[HIST_SLOTS];   // current day and its latest observed counters
 
@@ -2955,10 +2995,12 @@ static size_t dailyCapBytes() {
 // trimming is byte-based (like appendLineCapped()'s raw-sample cap) rather than a fixed row count so it
 // grows and shrinks smoothly as the reader count changes instead of jumping between fixed slot sizes.
 static String withDailyRow(String all, uint32_t dayStart, uint32_t imp, uint32_t exp,
-                            uint32_t dayWh, uint32_t nightWh, size_t capBytes) {
-  char row[80];
-  snprintf(row, sizeof row, "%lu,%lu,%lu,%lu,%lu", (unsigned long)dayStart, (unsigned long)imp,
-           (unsigned long)exp, (unsigned long)dayWh, (unsigned long)nightWh);
+                            uint32_t dayWh, uint32_t nightWh,
+                            uint32_t htWh, uint32_t stWh, uint32_t ntWh, size_t capBytes) {
+  char row[110];
+  snprintf(row, sizeof row, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu", (unsigned long)dayStart, (unsigned long)imp,
+           (unsigned long)exp, (unsigned long)dayWh, (unsigned long)nightWh,
+           (unsigned long)htWh, (unsigned long)stWh, (unsigned long)ntWh);
   String content;
   if (all.length() == 0) {
     content = String(row) + "\n";
@@ -2984,9 +3026,9 @@ static String withDailyRow(String all, uint32_t dayStart, uint32_t imp, uint32_t
 }
 
 static void persistDaily(const String &id, uint32_t dayStart, uint32_t imp, uint32_t exp,
-                          uint32_t dayWh, uint32_t nightWh) {
+                          uint32_t dayWh, uint32_t nightWh, uint32_t htWh, uint32_t stWh, uint32_t ntWh) {
   String path = fpD(id);
-  fsWrite(path, withDailyRow(fsRead(path), dayStart, imp, exp, dayWh, nightWh, dailyCapBytes()));
+  fsWrite(path, withDailyRow(fsRead(path), dayStart, imp, exp, dayWh, nightWh, htWh, stWh, ntWh, dailyCapBytes()));
 }
 
 static uint32_t localDayStart(time_t ep) {
@@ -3036,27 +3078,44 @@ static void beginDay(int slot, const String &id, uint32_t dayStart) {
     uint32_t oldEp, oldImp, oldExp;
     if (lastSample(id, oldEp, oldImp, oldExp)) {
       uint32_t oldDay = localDayStart((time_t)oldEp);
-      // no day/night split recoverable across a reboot gap -- the live accumulator that would have tracked
-      // it started fresh this boot, same as every other in-RAM-only state
-      if (oldDay != dayStart) persistDaily(id, oldDay, oldImp, oldExp, 0, 0);
+      // no day/night or HT/ST/NT split recoverable across a reboot gap -- the live accumulator that would
+      // have tracked it started fresh this boot, same as every other in-RAM-only state
+      if (oldDay != dayStart) persistDaily(id, oldDay, oldImp, oldExp, 0, 0, 0, 0, 0);
     }
   } else {
-    persistDaily(id, d.day, d.imp, d.exp, d.dayWh, d.nightWh);
+    persistDaily(id, d.day, d.imp, d.exp, d.dayWh, d.nightWh, d.htWh, d.stWh, d.ntWh);
   }
   d.day = dayStart;
-  d.dayWh = 0; d.nightWh = 0;   // start the new day's live day/night split fresh
+  d.dayWh = 0; d.nightWh = 0;              // start the new day's live day/night split fresh
+  d.htWh = 0; d.stWh = 0; d.ntWh = 0;      // ...and the live HT/ST/NT split fresh
 }
 
-// Is `now` inside reader `r`'s configured night window? Off (always "day") unless nightTariffOn -- and for
-// a degenerate window (start == end) too, since that's not a real range. start/end wrap past midnight when
-// start >= end (e.g. 22..6 means "22:00 through 05:59").
+// Is hour `h` (0-23) inside the [s,e) window? A degenerate window (s==e) is "unused"/always false -- shared
+// convention for every hour-window field in this file (nightStartHour/nightEndHour, htStart/htEnd,
+// ntStart/ntEnd). Wraps past midnight when s >= e (e.g. 22..6 means "22:00 through 05:59").
+static bool inHourWindow(uint8_t s, uint8_t e, int h) {
+  if (s == e) return false;
+  return s < e ? (h >= s && h < e) : (h >= s || h < e);
+}
+
+// Is `now` inside reader `r`'s configured night window? Off (always "day") unless nightTariffOn.
 static bool isNightNow(const Reader &r, time_t now) {
   if (!r.nightTariffOn) return false;
-  uint8_t s = r.nightStartHour, e = r.nightEndHour;
-  if (s == e) return false;
+  struct tm lt; localtime_r(&now, &lt);
+  return inHourWindow(r.nightStartHour, r.nightEndHour, lt.tm_hour);
+}
+
+// Which §14a Modul-3 zone `now` falls into for reader `r` (tariffMode==2 only -- caller checks that).
+// HT is checked before NT, so a misconfigured overlap resolves to the (usually pricier) HT zone rather than
+// silently favoring NT; ST is the fallback for "in neither window", exactly like the day rate is "not in the
+// night window" above.
+enum TariffZone : uint8_t { ZONE_ST = 0, ZONE_HT = 1, ZONE_NT = 2 };
+static TariffZone tariffZoneNow(const Reader &r, time_t now) {
   struct tm lt; localtime_r(&now, &lt);
   int h = lt.tm_hour;
-  return s < e ? (h >= s && h < e) : (h >= s || h < e);
+  for (int i = 0; i < 2; i++) if (inHourWindow(r.htStart[i], r.htEnd[i], h)) return ZONE_HT;
+  for (int i = 0; i < 2; i++) if (inHourWindow(r.ntStart[i], r.ntEnd[i], h)) return ZONE_NT;
+  return ZONE_ST;
 }
 
 // Poll readers and log a sample when the counter moves or every 5 min (heartbeat). Throttled internally.
@@ -3083,8 +3142,14 @@ static void historyService() {
     } else if (hDaily[i].imp) {    // not the first-ever observation this boot -- imp already a real baseline
       long delta = (long)r.import_ - (long)hDaily[i].imp;   // Wh since the last poll; counters only rise
       if (delta > 0) {
-        if (isNightNow(r, tnow)) hDaily[i].nightWh += (uint32_t)delta;
-        else                     hDaily[i].dayWh   += (uint32_t)delta;
+        if (r.tariffMode == 2) {
+          switch (tariffZoneNow(r, tnow)) {
+            case ZONE_HT: hDaily[i].htWh += (uint32_t)delta; break;
+            case ZONE_NT: hDaily[i].ntWh += (uint32_t)delta; break;
+            default:      hDaily[i].stWh += (uint32_t)delta; break;
+          }
+        } else if (isNightNow(r, tnow)) hDaily[i].nightWh += (uint32_t)delta;
+        else                            hDaily[i].dayWh   += (uint32_t)delta;
       }
     }
     hDaily[i].imp = r.import_;
@@ -3180,11 +3245,15 @@ static void handleHistoryReaders() {
 
 // Resolve the effective price for reader `id`: its own saved value, else the bootstrap default (no global
 // setting exists -- every reader's price is independent). Also resolves the day-night tariff fields (off,
-// with sane defaults, if the reader isn't known or has it off).
+// with sane defaults, if the reader isn't known or has it off), and the §14a HT/ST/NT tariff fields
+// (tariffMode/htPrice/ntPrice -- the window times themselves aren't needed here, only in readersJson() for
+// the settings-card prefill; the cost calc only needs the per-day htWh/stWh/ntWh split plus these 3 prices).
 static void resolveReaderPrice(const String &id, float &priceCent, float &exportCent,
-                                bool &nightOn, uint8_t &nightStart, uint8_t &nightEnd, float &nightPriceCent) {
+                                bool &nightOn, uint8_t &nightStart, uint8_t &nightEnd, float &nightPriceCent,
+                                uint8_t &tariffMode, float &htPriceCent, float &ntPriceCent) {
   priceCent = DEFAULT_PRICE_CENT; exportCent = DEFAULT_EXPORT_CENT;
   nightOn = false; nightStart = 22; nightEnd = 6; nightPriceCent = DEFAULT_PRICE_CENT;
+  tariffMode = 0; htPriceCent = DEFAULT_PRICE_CENT; ntPriceCent = DEFAULT_PRICE_CENT;
   for (int i = 0; i < MAX_READERS; i++)
     if (readers[i].used && hex(readers[i].handle, 3) == id) {
       Reader &r = readers[i];
@@ -3192,6 +3261,9 @@ static void resolveReaderPrice(const String &id, float &priceCent, float &export
       if (r.exportCentOverride >= 0) exportCent = r.exportCentOverride;
       nightOn = r.nightTariffOn; nightStart = r.nightStartHour; nightEnd = r.nightEndHour;
       nightPriceCent = r.nightPriceCent >= 0 ? r.nightPriceCent : priceCent;
+      tariffMode = r.tariffMode;
+      htPriceCent = r.htPriceCent >= 0 ? r.htPriceCent : priceCent;
+      ntPriceCent = r.ntPriceCent >= 0 ? r.ntPriceCent : priceCent;
       break;
     }
 }
@@ -3210,8 +3282,10 @@ static void handleHistoryApi() {
   server.send(200, "application/json", "");
   bool tv = timeValid();   // gate "now" itself too — the client uses it for day-bucketing ("today" match);
                             // an out-of-range clock (see timeValid()) must never leak into that as if real.
-  float priceCent, exportCent, nightPriceCent; bool nightOn; uint8_t nightStart, nightEnd;
-  resolveReaderPrice(id, priceCent, exportCent, nightOn, nightStart, nightEnd, nightPriceCent);
+  float priceCent, exportCent, nightPriceCent, htPriceCent, ntPriceCent;
+  bool nightOn; uint8_t nightStart, nightEnd, tariffMode;
+  resolveReaderPrice(id, priceCent, exportCent, nightOn, nightStart, nightEnd, nightPriceCent,
+                     tariffMode, htPriceCent, ntPriceCent);
   server.sendContent(String("{\"id\":\"") + id + "\",\"now\":" + String(tv ? (uint32_t)time(nullptr) : 0) +
                      ",\"tvalid\":" + (tv ? "true" : "false") +
                      ",\"fs\":" + (g_fsOk ? "true" : "false") +
@@ -3219,14 +3293,18 @@ static void handleHistoryApi() {
                      ",\"eprice\":" + String(exportCent, 2) +
                      ",\"night_on\":" + (nightOn ? "true" : "false") +
                      ",\"night_start\":" + String(nightStart) + ",\"night_end\":" + String(nightEnd) +
-                     ",\"night_price\":" + String(nightPriceCent, 2) + ",\"samples\":[");
+                     ",\"night_price\":" + String(nightPriceCent, 2) +
+                     ",\"tariff_mode\":" + String(tariffMode) +
+                     ",\"ht_price\":" + String(htPriceCent, 2) +
+                     ",\"nt_price\":" + String(ntPriceCent, 2) + ",\"samples\":[");
   { String s = g_fsOk ? fsRead(fpS(id)) : String(); streamRows(s); }
   server.sendContent("],\"daily\":[");
   {
     String d = g_fsOk ? fsRead(fpD(id)) : String();
     for (int i = 0; i < MAX_READERS; i++)
       if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-        d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh, dailyCapBytes());
+        d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
+                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
         break;
       }
     streamRows(d);
@@ -3250,10 +3328,11 @@ static String buildDailyCsv(const String &id) {
   String d = fsRead(fpD(id));
   for (int i = 0; i < MAX_READERS; i++)
     if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-      d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh, dailyCapBytes());
+      d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
+                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
       break;
     }
-  String out = "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh\n";
+  String out = "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh,ht_wh,st_wh,nt_wh\n";
   int i = 0, n = (int)d.length();
   while (i < n) {
     int nl = d.indexOf('\n', i); if (nl < 0) nl = n;
@@ -3595,10 +3674,11 @@ static void handleHistoryCsv() {
       String d = fsRead(fpD(id));
       for (int i = 0; i < MAX_READERS; i++)
         if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-          d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh, dailyCapBytes());
+          d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
+                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
           break;
         }
-      sendCsvRows(d, "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh");
+      sendCsvRows(d, "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh,ht_wh,st_wh,nt_wh");
     } else {
       sendCsvRows(fsRead(fpS(id)), "date,epoch,import_wh,export_wh,power_w");
     }
@@ -3727,8 +3807,13 @@ const T={
   kImp:'Import · Bezug gesamt (kWh)',kExp:'Export · Einspeisung gesamt (kWh)',kToday:'Verbrauch heute – bisher (kWh)',
   kCost:p=>'Kosten heute ('+p+' ct/kWh)',kTodayExp:'Einspeisung heute – bisher (kWh)',
   kEarn:p=>'Erlös heute ('+p+' ct/kWh)',
-  cNight:'Tag-/Nacht-Tarif für diesen Reader',
-  lNightOn:'Tag-/Nacht-Tarif aktiv',capNight:'Wenn aktiv, wird der Verbrauch ab jetzt live nach Uhrzeit in Tag- und Nachtanteil aufgeteilt und getrennt bepreist (Tagpreis: Feld oben rechts). Gilt nur für neu erfasste Werte, nicht rückwirkend.',
+  cNight:'Zeitvariabler Tarif für diesen Reader',
+  lMode:'Modus',mOff:'Aus (fester Preis)',mNight:'Tag-/Nacht-Tarif (2 Zonen)',mHtNt:'§14a Modul 3 – HT/ST/NT (3 Zonen)',
+  lNightOn:'Tag-/Nacht-Tarif aktiv',capNight:'Wenn aktiv, wird der Verbrauch ab jetzt live nach Uhrzeit in Zonen aufgeteilt und getrennt bepreist. Gilt nur für neu erfasste Werte, nicht rückwirkend.',
+  capHtNt:'Hochlast (HT) und Niedriglast (NT) je bis zu 2 Zeitfenster (Std., 0–23, Ende exklusiv; über Mitternacht möglich, z. B. 22→6). Standardtarif (ST) gilt automatisch außerhalb dieser Fenster – kein eigenes Feld nötig. Ein Fenster mit gleichem Start/Ende ist deaktiviert. Preis oben rechts = ST-Preis.',
+  lHtPrice:'HT-Preis (ct/kWh)',lNtPrice:'NT-Preis (ct/kWh)',
+  lHtWin1:'HT-Fenster 1 (von/bis Std.)',lHtWin2:'HT-Fenster 2 (von/bis Std.)',
+  lNtWin1:'NT-Fenster 1 (von/bis Std.)',lNtWin2:'NT-Fenster 2 (von/bis Std.)',
   lNightStart:'Nacht ab (Std.)',lNightEnd:'Nacht bis (Std.)',lNightPrice:'Nachtpreis (ct/kWh)',bSavePrice:'Speichern',
   cDay:'Verbrauch pro Tag',capDay:'kWh/Tag aus den Änderungen des Zählerstands (zuverlässig, unabhängig vom Watt-Wert).',
   cDayExp:'Einspeisung pro Tag',capDayExp:'kWh/Tag per Solar ins Netz eingespeist — aus den Änderungen des Export-Zählerstands.',
@@ -3758,8 +3843,13 @@ const T={
   kImp:'Import · consumed total (kWh)',kExp:'Export · fed-in total (kWh)',kToday:'Consumption today – so far (kWh)',
   kCost:p=>'Cost today ('+p+' ct/kWh)',kTodayExp:'Feed-in today – so far (kWh)',
   kEarn:p=>'Earnings today ('+p+' ct/kWh)',
-  cNight:'Day/night tariff for this reader',
-  lNightOn:'Day/night tariff active',capNight:'When on, consumption is split live by time of day into a day and a night share from now on, each billed at its own rate (day price: field top right). Applies only to newly recorded values, not retroactively.',
+  cNight:'Time-variable tariff for this reader',
+  lMode:'Mode',mOff:'Off (flat price)',mNight:'Day/night tariff (2 zones)',mHtNt:'§14a Module 3 – HT/ST/NT (3 zones)',
+  lNightOn:'Day/night tariff active',capNight:'When on, consumption is split live by time of day into zones and billed separately from now on. Applies only to newly recorded values, not retroactively.',
+  capHtNt:'High-load (HT) and low-load (NT), each up to 2 time windows (hours, 0-23, end exclusive; can wrap past midnight, e.g. 22→6). Standard tariff (ST) automatically applies outside these windows -- no field of its own needed. A window with equal start/end is disabled. The price field top right is the ST price.',
+  lHtPrice:'HT price (ct/kWh)',lNtPrice:'NT price (ct/kWh)',
+  lHtWin1:'HT window 1 (from/to h)',lHtWin2:'HT window 2 (from/to h)',
+  lNtWin1:'NT window 1 (from/to h)',lNtWin2:'NT window 2 (from/to h)',
   lNightStart:'Night from (h)',lNightEnd:'Night until (h)',lNightPrice:'Night price (ct/kWh)',bSavePrice:'Save',
   cDay:'Consumption per day',capDay:'kWh/day from the meter-counter changes (reliable, independent of the Watt value).',
   cDayExp:'Feed-in per day',capDayExp:'kWh/day fed into the grid (solar) — from the export-counter changes.',
@@ -3893,16 +3983,32 @@ async function saveEprice(){if(!cur)return;let v=parseFloat($('eprice').value);i
  try{await fetch('/api/reader/price?id='+cur+'&ecent='+v,{method:'POST'});}catch(e){}
  $('esaved').textContent='✓';setTimeout(()=>{$('esaved').textContent='';},1500);
  load();}                                    // refresh the earnings columns for the current reader
+// mode 0 = off, 1 = day/night (existing 2-zone fields), 2 = §14a HT/ST/NT (new 3-zone fields) -- see
+// tariffMode in reader.h/gw_set_reader_price(). Only one scheme's fields are ever shown/editable at once
+// (tariffModeUi() below), but ALL of them are sent together every save: the OTHER scheme's fields are simply
+// echoed back from whatever this reader already had saved (server-side default in handleReaderPrice()), so
+// switching modes back and forth never loses a previously-entered config.
+function tariffModeUi(){
+ const m=$('rmode').value;
+ $('rnightbox').hidden=m!=='1';
+ $('rhtntbox').hidden=m!=='2';
+}
 async function saveReaderPrice(){
- // just the night-tariff fields -- the base/export price lives in the header boxes and saves separately
- // (savePrice()/saveEprice()), thanks to /api/reader/price's partial-update semantics
+ // the base/export price lives in the header boxes and saves separately (savePrice()/saveEprice()), thanks
+ // to /api/reader/price's partial-update semantics
  if(!cur)return;
  const b=new URLSearchParams();
  b.set('id',cur);
- b.set('night',$('rnight').checked?'1':'0');
+ b.set('mode',$('rmode').value);
  b.set('nstart',$('rnstart').value||22);
  b.set('nend',$('rnend').value||6);
  if($('rnprice').value)b.set('nprice',$('rnprice').value);
+ if($('rhtp').value)b.set('htp',$('rhtp').value);
+ if($('rntp').value)b.set('ntp',$('rntp').value);
+ b.set('ht0s',$('rht0s').value||0);b.set('ht0e',$('rht0e').value||0);
+ b.set('ht1s',$('rht1s').value||0);b.set('ht1e',$('rht1e').value||0);
+ b.set('nt0s',$('rnt0s').value||0);b.set('nt0e',$('rnt0e').value||0);
+ b.set('nt1s',$('rnt1s').value||0);b.set('nt1e',$('rnt1e').value||0);
  $('rpricemsg').textContent='…';
  try{await fetch('/api/reader/price',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:b});}catch(e){}
  try{let d=await(await fetch('/api/readers')).json();readers=Array.isArray(d)?d:(d.readers||[]);}catch(e){}
@@ -3924,7 +4030,7 @@ async function load(silent){
  if(!cur)return;
  if(!silent)main.innerHTML='<div class=empty>'+t('loading')+'</div>';
  let h;try{h=await (await fetch('/api/history?id='+cur)).json();}catch(e){if(!silent)main.innerHTML='<div class=card><div class=empty>'+t('loadErr')+'</div></div>';return;}
- const S=h.samples||[],days=(h.daily||[]).map(d=>({ep:d[0],imp:d[1],exp:d[2],dayWh:d[3]||0,nightWh:d[4]||0}));
+ const S=h.samples||[],days=(h.daily||[]).map(d=>({ep:d[0],imp:d[1],exp:d[2],dayWh:d[3]||0,nightWh:d[4]||0,htWh:d[5]||0,stWh:d[6]||0,ntWh:d[7]||0}));
  // shared time window (header select, default 1h, capped at 24h) for every raw-sample view below --
  // Import/Export/Power charts and the Watt table all use the SAME cutoff, so the page stays predictable
  // instead of each one picking its own amount to show. KPIs further down intentionally keep using the
@@ -3945,12 +4051,19 @@ async function load(silent){
  // split only exists going forward from when it was enabled -- there's nothing to backfill it from.
  const nightOn=!!h.night_on;
  const nightPrice=(h.night_price!=null?h.night_price:price),neur=nightPrice/100;
+ // §14a HT/ST/NT 3-zone tariff: same idea, blended from the ht_wh/st_wh/nt_wh split instead -- see
+ // tariffZoneNow()/historyService() in gateway_web.cpp. Mutually exclusive with the day/night tariff above
+ // (tariffMode picks at most one of the two schemes; see the settings card at the bottom of this page).
+ const tariffMode=h.tariff_mode||0;
+ const htPrice=(h.ht_price!=null?h.ht_price:price),hteur=htPrice/100;
+ const ntPrice=(h.nt_price!=null?h.nt_price:price),nteur=ntPrice/100;
  // per-day consumption from the kWh-counter deltas (import can only rise), plus each day's cost -- blended
- // day/night when the tariff is on, otherwise the plain flat-rate calc.
+ // HT/ST/NT, or day/night, or the plain flat-rate calc, whichever tariff is active.
  let cons=[];
  for(let i=1;i<days.length;i++){let di=(days[i].imp-days[i-1].imp)/1000,de=(days[i].exp-days[i-1].exp)/1000;
   di=di<0?0:di; de=de<0?0:de;
-  let cost=nightOn?(days[i].dayWh||0)/1000*eur+(days[i].nightWh||0)/1000*neur:di*eur;
+  let cost=tariffMode===2?(days[i].htWh||0)/1000*hteur+(days[i].stWh||0)/1000*eur+(days[i].ntWh||0)/1000*nteur
+           :nightOn?(days[i].dayWh||0)/1000*eur+(days[i].nightWh||0)/1000*neur:di*eur;
   cons.push({ep:days[i].ep,imp:di,exp:de,cost});}
  let html='';
  if(!h.tvalid)html+='<div class=warn>'+t('ntp')+'</div>';
@@ -3972,15 +4085,16 @@ async function load(silent){
   const base=days[days.length-2];                               // counter at the start of today (yesterday's close)
   const curImp=last?last[1]:days[days.length-1].imp,curExp=last?last[2]:days[days.length-1].exp;
   today=Math.max(0,(curImp-base.imp)/1000);todayExp=Math.max(0,(curExp-base.exp)/1000);
-  const t=days[days.length-1];   // today's RAM-merged row already carries the live day/night split
-  todayCost=nightOn?Math.max(0,t.dayWh||0)/1000*eur+Math.max(0,t.nightWh||0)/1000*neur:today*eur;}
+  const t=days[days.length-1];   // today's RAM-merged row already carries the live day/night (or HT/ST/NT) split
+  todayCost=tariffMode===2?Math.max(0,t.htWh||0)/1000*hteur+Math.max(0,t.stWh||0)/1000*eur+Math.max(0,t.ntWh||0)/1000*nteur
+            :nightOn?Math.max(0,t.dayWh||0)/1000*eur+Math.max(0,t.nightWh||0)/1000*neur:today*eur;}
  if(today==null&&S.length){let tk=dayKey(h.now),td=S.filter(s=>dayKey(s[0])===tk);   // first-day fallback
   if(td.length>=2){today=Math.max(0,(td[td.length-1][1]-td[0][1])/1000);todayExp=Math.max(0,(td[td.length-1][2]-td[0][2])/1000);todayCost=today*eur;}}
  html+='<div class=kpis>'+
   `<div class=kpi><div class=v>${nf(totImp,2)}</div><div class=l>${t('kImp')}</div></div>`+
   `<div class=kpi><div class="v neg">${nf(totExp,2)}</div><div class=l>${t('kExp')}</div></div>`+
   `<div class=kpi><div class=v>${today==null?'—':nf(today,2)}</div><div class=l>${t('kToday')}</div></div>`+
-  (eur>0?`<div class=kpi><div class="v euro">${todayCost==null?'—':nf(todayCost,2)+' €'}</div><div class=l>${t('kCost')(nightOn?nf(price,2)+'/'+nf(nightPrice,2):nf(price,2))}</div></div>`:'')+
+  (eur>0?`<div class=kpi><div class="v euro">${todayCost==null?'—':nf(todayCost,2)+' €'}</div><div class=l>${t('kCost')(tariffMode===2?nf(htPrice,2)+'/'+nf(price,2)+'/'+nf(ntPrice,2):nightOn?nf(price,2)+'/'+nf(nightPrice,2):nf(price,2))}</div></div>`:'')+
   (anyExp?`<div class=kpi><div class="v neg">${todayExp==null?'—':nf(todayExp,2)}</div><div class=l>${t('kTodayExp')}</div></div>`:'')+
   (anyExp&&eeur>0?`<div class=kpi><div class="v euro">${todayExp==null?'—':nf(todayExp*eeur,2)+' €'}</div><div class=l>${t('kEarn')(nf(eprice,2))}</div></div>`:'')+
  '</div>';
@@ -4104,15 +4218,37 @@ async function load(silent){
  // /api/history only returns the resolved price.
  { const rdr=readers.find(x=>x.id===cur);
    if(rdr){
-    const nOn=!!rdr.night_on;
+    const mode=rdr.tariff_mode||0;
+    const hw=rdr.ht_win||[0,0,0,0],nw=rdr.nt_win||[0,0,0,0];
+    const hi=(id,v)=>'<input id="'+id+'" type=number min=0 max=23 value="'+v+'">';
     html+='<div class=card><h2>'+t('cNight')+'</h2>'+
-     '<label style="display:flex;align-items:center;gap:8px;margin-top:4px;cursor:pointer">'+
-      '<input type=checkbox id=rnight style="width:auto;margin:0"'+(nOn?' checked':'')+'><span>'+t('lNightOn')+'</span></label>'+
+     '<div><label>'+t('lMode')+'</label><select id=rmode onchange=tariffModeUi()>'+
+      '<option value=0'+(mode===0?' selected':'')+'>'+t('mOff')+'</option>'+
+      '<option value=1'+(mode===1?' selected':'')+'>'+t('mNight')+'</option>'+
+      '<option value=2'+(mode===2?' selected':'')+'>'+t('mHtNt')+'</option>'+
+     '</select></div>'+
      '<p class=cap>'+t('capNight')+'</p>'+
-     '<div class=grid>'+
-      '<div><label>'+t('lNightStart')+'</label><input id=rnstart type=number min=0 max=23 value="'+(rdr.night_start!=null?rdr.night_start:22)+'"></div>'+
-      '<div><label>'+t('lNightEnd')+'</label><input id=rnend type=number min=0 max=23 value="'+(rdr.night_end!=null?rdr.night_end:6)+'"></div>'+
-      '<div><label>'+t('lNightPrice')+'</label><input id=rnprice type=number step=1 min=0'+(rdr.night_price_cent!=null?' value="'+rdr.night_price_cent+'"':'')+'></div>'+
+     '<div id=rnightbox'+(mode!==1?' hidden':'')+'>'+
+      '<div class=grid>'+
+       '<div><label>'+t('lNightStart')+'</label><input id=rnstart type=number min=0 max=23 value="'+(rdr.night_start!=null?rdr.night_start:22)+'"></div>'+
+       '<div><label>'+t('lNightEnd')+'</label><input id=rnend type=number min=0 max=23 value="'+(rdr.night_end!=null?rdr.night_end:6)+'"></div>'+
+       '<div><label>'+t('lNightPrice')+'</label><input id=rnprice type=number step=1 min=0'+(rdr.night_price_cent!=null?' value="'+rdr.night_price_cent+'"':'')+'></div>'+
+      '</div>'+
+     '</div>'+
+     '<div id=rhtntbox'+(mode!==2?' hidden':'')+'>'+
+      '<p class=cap>'+t('capHtNt')+'</p>'+
+      '<div class=grid>'+
+       '<div><label>'+t('lHtPrice')+'</label><input id=rhtp type=number step=1 min=0'+(rdr.ht_price_cent!=null?' value="'+rdr.ht_price_cent+'"':'')+'></div>'+
+       '<div><label>'+t('lNtPrice')+'</label><input id=rntp type=number step=1 min=0'+(rdr.nt_price_cent!=null?' value="'+rdr.nt_price_cent+'"':'')+'></div>'+
+      '</div>'+
+      '<div class=grid>'+
+       '<div><label>'+t('lHtWin1')+'</label>'+hi('rht0s',hw[0])+hi('rht0e',hw[1])+'</div>'+
+       '<div><label>'+t('lHtWin2')+'</label>'+hi('rht1s',hw[2])+hi('rht1e',hw[3])+'</div>'+
+      '</div>'+
+      '<div class=grid>'+
+       '<div><label>'+t('lNtWin1')+'</label>'+hi('rnt0s',nw[0])+hi('rnt0e',nw[1])+'</div>'+
+       '<div><label>'+t('lNtWin2')+'</label>'+hi('rnt1s',nw[2])+hi('rnt1e',nw[3])+'</div>'+
+      '</div>'+
      '</div>'+
      '<div class=row><button onclick=saveReaderPrice()>'+t('bSavePrice')+'</button><span class=msg id=rpricemsg></span></div>'+
     '</div>';

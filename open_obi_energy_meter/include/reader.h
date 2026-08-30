@@ -71,6 +71,22 @@ struct Reader {
   bool     nightTariffOn   = false;
   uint8_t  nightStartHour  = 22, nightEndHour = 6;   // hour-of-day [start,end); wraps past midnight if start>=end
   float    nightPriceCent  = -1;    // -1 = not set (falls back to the day rate if nightTariffOn is somehow on anyway)
+
+  // §14a EnWG Modul 3 "HT/ST/NT" 3-zone tariff -- an opt-in ALTERNATIVE to the day/night 2-zone tariff
+  // above, never both at once (see tariffMode). ST (Standardtarif) has no window of its own: like the day
+  // rate above, it's simply "whatever isn't inside an HT or NT window". HT and NT each get up to 2
+  // independent [start,end) windows (a slot with start==end is unused, same convention as
+  // nightStartHour==nightEndHour above) -- covers the common real-world shape of a split HT window (morning
+  // + evening peak) without needing dynamic storage. Bucketed live exactly like dayWh/nightWh -- see
+  // htWh/stWh/ntWh in gateway_web.cpp's DailyState.
+  uint8_t  tariffMode = 0;          // 0 = flat/off, 1 = day/night 2-zone (nightTariffOn fields above),
+                                     // 2 = HT/ST/NT 3-zone (fields below). Kept as its own field rather than
+                                     // folded into nightTariffOn so a firmware rollback still finds a sane
+                                     // 2-zone-or-off config either way -- see savePriceCfg()/loadPriceCfg().
+  float    htPriceCent = -1;        // Hochlast price ct/kWh; -1 = not set (falls back to priceCentOverride)
+  float    ntPriceCent = -1;        // Niedriglast price ct/kWh; -1 = falls back to priceCentOverride
+  uint8_t  htStart[2] = {0, 0}, htEnd[2] = {0, 0};   // up to 2 HT windows
+  uint8_t  ntStart[2] = {0, 0}, ntEnd[2] = {0, 0};   // up to 2 NT windows
 };
 
 // defined in main.cpp
@@ -96,10 +112,14 @@ uint32_t gw_uptime_s();
 bool gw_assign_reader(const uint8_t handle[3], bool on);              // accept (or drop) a reader onto this gateway
 bool gw_set_reader_name(const uint8_t handle[3], const char *name);   // set ("" clears) the friendly name; false = unknown reader
 bool gw_set_reader_boxcfg(const uint8_t handle[3], const char *cfg);  // set ("" clears) the dashboard box layout; false = unknown reader
-// set (or clear, with a negative price) a reader's price override / day-night tariff; false = unknown reader.
-// nightStart/nightEnd are hours 0-23; the caller always sends the full set together (see /api/reader/price).
+// set (or clear, with a negative price) a reader's price override / day-night tariff / §14a HT-ST-NT tariff;
+// false = unknown reader. nightStart/nightEnd and every htXs/htXe/ntXs/ntXe are hours 0-23 (a pair with
+// start==end means "unused"); the caller always sends the full set together (see /api/reader/price).
 bool gw_set_reader_price(const uint8_t handle[3], float priceCent, float exportCent,
-                          bool nightOn, uint8_t nightStart, uint8_t nightEnd, float nightPriceCent);
+                          bool nightOn, uint8_t nightStart, uint8_t nightEnd, float nightPriceCent,
+                          uint8_t tariffMode, float htPriceCent, float ntPriceCent,
+                          uint8_t ht0s, uint8_t ht0e, uint8_t ht1s, uint8_t ht1e,
+                          uint8_t nt0s, uint8_t nt0e, uint8_t nt1s, uint8_t nt1e);
 void gw_pair_all(uint16_t seconds);                                   // open a window that auto-assigns every reader
 uint32_t gw_pair_remaining_s();                                       // seconds left in the auto-pair window (0 = off)
 
