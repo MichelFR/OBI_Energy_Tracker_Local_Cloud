@@ -465,6 +465,7 @@ bool gw_set_reader_price(const uint8_t handle[3], float priceCent, float exportC
   (void)nightOn;   // superseded by the tariffMode-derived value below -- kept as a param for API stability
   for (auto &r : readers)
     if (r.used && !memcmp(r.handle, handle, 3)) {
+      uint8_t oldMode = r.tariffMode;
       r.priceCentOverride = priceCent; r.exportCentOverride = exportCent;
       r.tariffMode = (tariffMode <= 2) ? tariffMode : 0;
       // Derived, not taken from the caller's nightOn -- this is what keeps switching modes (e.g. 1 -> 2 -> 0)
@@ -479,6 +480,11 @@ bool gw_set_reader_price(const uint8_t handle[3], float priceCent, float exportC
       r.ntStart[0] = (uint8_t)(nt0s % 24); r.ntEnd[0] = (uint8_t)(nt0e % 24);
       r.ntStart[1] = (uint8_t)(nt1s % 24); r.ntEnd[1] = (uint8_t)(nt1e % 24);
       savePriceCfg(handle, r);
+      // A tariff-mode change alters which zone-breakdown sensors are relevant (day/night vs HT/ST/NT) --
+      // re-announce so HA drops the no-longer-relevant ones and picks up the newly-relevant ones (see
+      // publishDiscovery() in gateway_web.cpp, which clears/(re)publishes each one based on tariffMode).
+      // Same mechanism already used for a rename; harmless/idempotent if the mode didn't actually change.
+      if (r.tariffMode != oldMode) r.mqttDiscovered = false;
       return true;
     }
   return false;

@@ -2828,6 +2828,13 @@ struct DailyState { uint32_t day = 0, imp = 0, exp = 0;
                                             // see tariffZoneNow()/historyService() below. Mutually exclusive
                                             // with dayWh/nightWh above: a reader only ever feeds ONE pair,
                                             // matching its own tariffMode; the other stays 0.
+  bool     haveStart = false;        // true once impStart/expStart below hold a real "start of today" value
+                                      // (see beginDay()) -- false right after a reader's very first-ever
+                                      // observation this boot, when no durable prior close is available yet,
+                                      // same "nothing to backfill from" gap the History page's JS handles.
+  uint32_t impStart = 0, expStart = 0;   // reader's import_/export_ at the moment TODAY began -- lets
+                                          // readerTodayStats()/mqttService() report "today so far" without
+                                          // any flash reads, unlike the History page's own equivalent calc.
 };
 static DailyState hDaily[HIST_SLOTS];   // current day and its latest observed counters
 
@@ -3070,8 +3077,33 @@ static bool lastSample(const String &id, uint32_t &ep, uint32_t &imp, uint32_t &
   return true;
 }
 
+// Recover the last row ever PERSISTED to the daily-summary file -- unlike lastSample() above, this is only
+// ever written at a genuine day rollover (see persistDaily()'s call sites), so it still holds the last
+// *completed* day's closing counters even after a mid-day reboot has already appended today's entries to
+// the raw sample log. That makes it the right fallback for beginDay()'s "reboot happened today, not
+// overnight" case below.
+static bool lastDailyRow(const String &id, uint32_t &dayStart, uint32_t &imp, uint32_t &exp) {
+  String all = fsRead(fpD(id));
+  int end = (int)all.length();
+  while (end > 0 && (all[end - 1] == '\n' || all[end - 1] == '\r')) end--;
+  if (end == 0) return false;
+  int start = all.lastIndexOf('\n', end - 1) + 1;
+  unsigned long d, i, x;
+  if (sscanf(all.substring(start, end).c_str(), "%lu,%lu,%lu", &d, &i, &x) != 3) return false;
+  dayStart = (uint32_t)d; imp = (uint32_t)i; exp = (uint32_t)x;
+  return true;
+}
+
 // Finalize the previous day. After a reboot, recover the best durable closing value from the sample log
 // if it belongs to an unfinished previous day. Today's row remains in RAM until its day is complete.
+// Also captures impStart/expStart -- the reader's counters at the exact moment TODAY began -- wherever a
+// genuinely reliable one is available, so readerTodayStats() can report "today so far" without touching
+// flash on every MQTT publish. A reboot mid-day (the last stored sample is from TODAY, not a finished
+// previous day) has no opening value in the sample log -- but the persisted daily-summary file is only
+// ever written at a genuine rollover, so its last row is still the last *completed* day's close; fall back
+// to that (lastDailyRow()) so haveStart comes back true right after THIS reboot too, not just at the next
+// midnight. Only a reader with no history at all (nothing in either file yet) still starts with
+// haveStart=false, same "nothing to backfill" gap the History page's own JS handles.
 static void beginDay(int slot, const String &id, uint32_t dayStart) {
   DailyState &d = hDaily[slot];
   if (d.day == 0) {
@@ -3080,9 +3112,26 @@ static void beginDay(int slot, const String &id, uint32_t dayStart) {
       uint32_t oldDay = localDayStart((time_t)oldEp);
       // no day/night or HT/ST/NT split recoverable across a reboot gap -- the live accumulator that would
       // have tracked it started fresh this boot, same as every other in-RAM-only state
-      if (oldDay != dayStart) persistDaily(id, oldDay, oldImp, oldExp, 0, 0, 0, 0, 0);
+      if (oldDay != dayStart) {
+        persistDaily(id, oldDay, oldImp, oldExp, 0, 0, 0, 0, 0);
+        d.impStart = oldImp; d.expStart = oldExp; d.haveStart = true;   // genuine previous-day close
+      } else {
+        // mid-day reboot -- the sample log's newest entry is already from today. Recover the last
+        // COMPLETED day's closing counters from the daily-summary file instead.
+        uint32_t pDay, pImp, pExp;
+        if (lastDailyRow(id, pDay, pImp, pExp) && pDay != dayStart) {
+          d.impStart = pImp; d.expStart = pExp; d.haveStart = true;
+        } else {
+          d.haveStart = false;   // no completed-day close on record either -- truly nothing to start from
+        }
+      }
+    } else {
+      d.haveStart = false;     // no prior sample at all -- brand new reader
     }
   } else {
+    d.impStart = d.imp; d.expStart = d.exp; d.haveStart = true;   // yesterday's closing value, captured
+                                                                    // before persistDaily's read-modify-write
+                                                                    // below (which doesn't touch d.imp/d.exp)
     persistDaily(id, d.day, d.imp, d.exp, d.dayWh, d.nightWh, d.htWh, d.stWh, d.ntWh);
   }
   d.day = dayStart;
@@ -3116,6 +3165,65 @@ static TariffZone tariffZoneNow(const Reader &r, time_t now) {
   for (int i = 0; i < 2; i++) if (inHourWindow(r.htStart[i], r.htEnd[i], h)) return ZONE_HT;
   for (int i = 0; i < 2; i++) if (inHourWindow(r.ntStart[i], r.ntEnd[i], h)) return ZONE_NT;
   return ZONE_ST;
+}
+
+// Short machine-readable name for whatever zone reader `r` is in right now, across all three tariff
+// schemes -- used by MQTT/HA (a single "current zone" sensor covers every reader regardless of its mode)
+// and mirrors the labels used in the History page settings card 1:1.
+static const char *tariffZoneName(const Reader &r, time_t now) {
+  if (r.tariffMode == 2) {
+    switch (tariffZoneNow(r, now)) {
+      case ZONE_HT: return "ht";
+      case ZONE_NT: return "nt";
+      default:      return "st";
+    }
+  }
+  if (r.tariffMode == 1) return isNightNow(r, now) ? "night" : "day";
+  return "flat";
+}
+
+// The ct/kWh rate actually billed for reader `r` right now, whichever scheme is active -- the single
+// number a "current price" MQTT/HA sensor needs, without the subscriber having to know which scheme or do
+// its own zone lookup.
+static float tariffRateCentNow(const Reader &r, time_t now) {
+  float price = r.priceCentOverride >= 0 ? r.priceCentOverride : DEFAULT_PRICE_CENT;
+  if (r.tariffMode == 2) {
+    switch (tariffZoneNow(r, now)) {
+      case ZONE_HT: return r.htPriceCent >= 0 ? r.htPriceCent : price;
+      case ZONE_NT: return r.ntPriceCent >= 0 ? r.ntPriceCent : price;
+      default:      return price;
+    }
+  }
+  if (r.tariffMode == 1 && isNightNow(r, now))
+    return r.nightPriceCent >= 0 ? r.nightPriceCent : price;
+  return price;
+}
+
+// Today's consumption/export/cost/earnings for reader `r` (RAM slot `slot`, same index as readers[]/
+// hDaily[]) -- the server-side equivalent of the History page's own JS KPI calc (see load() there), so
+// MQTT/HA can show the same numbers without a browser. False (all outputs untouched) if there's no
+// reliable "start of today" baseline yet -- see haveStart in DailyState/beginDay().
+static bool readerTodayStats(int slot, const Reader &r, float &todayWh, float &todayExpWh,
+                              float &todayCostEur, float &todayEarnEur) {
+  const DailyState &d = hDaily[slot];
+  if (!d.haveStart) return false;
+  todayWh    = d.imp > d.impStart ? (float)(d.imp - d.impStart) : 0.0f;
+  todayExpWh = d.exp > d.expStart ? (float)(d.exp - d.expStart) : 0.0f;
+  float price      = r.priceCentOverride  >= 0 ? r.priceCentOverride  : DEFAULT_PRICE_CENT;
+  float exportCent = r.exportCentOverride >= 0 ? r.exportCentOverride : DEFAULT_EXPORT_CENT;
+  if (r.tariffMode == 2) {
+    float ht = r.htPriceCent >= 0 ? r.htPriceCent : price;
+    float nt = r.ntPriceCent >= 0 ? r.ntPriceCent : price;
+    todayCostEur = (d.htWh / 1000.0f) * (ht / 100.0f) + (d.stWh / 1000.0f) * (price / 100.0f) +
+                   (d.ntWh / 1000.0f) * (nt / 100.0f);
+  } else if (r.tariffMode == 1) {
+    float np = r.nightPriceCent >= 0 ? r.nightPriceCent : price;
+    todayCostEur = (d.dayWh / 1000.0f) * (price / 100.0f) + (d.nightWh / 1000.0f) * (np / 100.0f);
+  } else {
+    todayCostEur = (todayWh / 1000.0f) * (price / 100.0f);
+  }
+  todayEarnEur = (todayExpWh / 1000.0f) * (exportCent / 100.0f);
+  return true;
 }
 
 // Poll readers and log a sample when the counter moves or every 5 min (heartbeat). Throttled internally.
@@ -4574,9 +4682,52 @@ static void publishDiscovery(const Reader &r) {
        "{{ value_json['softver'] }}", true},
     {"hardware", "Hardware",  nullptr,           nullptr, nullptr,
        "{{ value_json['hardver'] }}", true},
+    // -- §14a / "today so far" stats (Part 2) -- server-computed so HA doesn't need to re-derive them from
+    // the raw import/export counters + this reader's own price config. today_* need a synced clock AND a
+    // same-day baseline (see readerTodayStats()/haveStart in gateway_web.cpp) -> guarded like power/power_calc.
+    // The zone breakdown (day_wh.../nt_wh) is NEVER null (0 is a real reading there, see mqttService()), so
+    // unguarded -- but only ONE pair (day/night or ht/st/nt) is ever actually nonzero for a given reader,
+    // matching its own tariff mode (see tariff_zone below); the other pair just stays at a steady 0.
+    {"today_wh",     "Consumption today",     "energy", "Wh",  "total_increasing",
+       "{% if value_json['today_wh'] is not none %}{{ value_json['today_wh'] }}{% endif %}", false},
+    {"today_exp_wh", "Feed-in today",         "energy", "Wh",  "total_increasing",
+       "{% if value_json['today_exp_wh'] is not none %}{{ value_json['today_exp_wh'] }}{% endif %}", false},
+    // HA only allows device_class "monetary" together with state_class "total" or "measurement", never
+    // "total_increasing" (unlike "energy", which allows all three) -- these still behave like a daily
+    // counter to HA's long-term statistics either way, "total" is just the class that's actually valid here.
+    {"today_cost",   "Cost today",            "monetary", "EUR", "total",
+       "{% if value_json['today_cost'] is not none %}{{ value_json['today_cost'] }}{% endif %}", false},
+    {"today_earn",   "Earnings today",        "monetary", "EUR", "total",
+       "{% if value_json['today_earn'] is not none %}{{ value_json['today_earn'] }}{% endif %}", false},
+    {"tariff_zone",  "Tariff zone",           nullptr,  nullptr, nullptr,
+       "{{ value_json['tariff_zone'] }}", false},   // flat | day | night | ht | st | nt -- see tariffZoneName()
+    {"tariff_rate",  "Tariff rate",           nullptr,  "ct/kWh", "measurement",
+       "{% if value_json['tariff_rate_cent'] is not none %}{{ value_json['tariff_rate_cent'] }}{% endif %}", false},
+    {"day_wh",   "Consumption today (day)",   "energy", "Wh", "total_increasing",
+       "{{ value_json['day_wh'] }}", false},
+    {"night_wh", "Consumption today (night)", "energy", "Wh", "total_increasing",
+       "{{ value_json['night_wh'] }}", false},
+    {"ht_wh",    "Consumption today (HT)",    "energy", "Wh", "total_increasing",
+       "{{ value_json['ht_wh'] }}", false},
+    {"st_wh",    "Consumption today (ST)",    "energy", "Wh", "total_increasing",
+       "{{ value_json['st_wh'] }}", false},
+    {"nt_wh",    "Consumption today (NT)",    "energy", "Wh", "total_increasing",
+       "{{ value_json['nt_wh'] }}", false},
   };
   for (const SDef &d : defs) {
     String topic = "homeassistant/sensor/" + uid + "/" + d.key + "/config";
+    // day_wh/night_wh only mean anything under the day/night 2-zone tariff (tariffMode==1); ht_wh/st_wh/
+    // nt_wh only under the §14a 3-zone tariff (tariffMode==2) -- publishing either pair outside its own
+    // mode would just be a permanently-0 sensor cluttering HA. Publish an EMPTY retained config instead
+    // when not relevant, so HA removes that entity if it was there from a previous mode (see
+    // gw_set_reader_price() in main.cpp, which re-announces on every mode change so this actually runs
+    // again promptly instead of only at the next reconnect).
+    bool is2Zone = !strcmp(d.key, "day_wh") || !strcmp(d.key, "night_wh");
+    bool is3Zone = !strcmp(d.key, "ht_wh") || !strcmp(d.key, "st_wh") || !strcmp(d.key, "nt_wh");
+    if ((is2Zone && r.tariffMode != 1) || (is3Zone && r.tariffMode != 2)) {
+      mqtt.publish(topic.c_str(), "", true);
+      continue;
+    }
     String p = "{\"name\":\"" + String(d.name) + "\",\"uniq_id\":\"" + uid + "_" + d.key + "\""
                ",\"stat_t\":\"" + stt + "\",\"val_tpl\":\"" + d.tpl + "\"" + avty;
     if (d.dc)   p += ",\"dev_cla\":\"" + String(d.dc) + "\"";
@@ -4816,20 +4967,62 @@ static void mqttService() {
       r.mqttPubEnergyMs = r.lastEnergyMs;
       String id = hex(r.handle, 3);
       String topic = String(g_mqttTopic) + "/" + id;
-      String p = "{\"id\":\"" + id + "\",\"uuid\":" +
-                 (r.haveUuid ? "\"" + uuidStr(r.uuid) + "\"" : "null") +
-                 ",\"type\":\"" + typeName(r.devType) + "\",\"battery_mV\":" + r.battery_mV +
-                 ",\"rssi\":" + (int)r.lastRssi + ",\"snr\":" + String(r.lastSnr, 1) + ",\"infrared\":" + ((r.flags & 1) ? "true" : "false") +
-                 ",\"import\":" + jnum(r.import_) + ",\"export\":" + jnum(r.export_) +
-                 ",\"power\":" + jnumS(r.power) +
-                 ",\"power_calc\":" + jnumS(r.calcPower) +
-                 ",\"softver\":" + String(r.softver) + ",\"hardver\":" + String(r.hardver) +
-                 ",\"paired\":" + (r.haveKey ? "true" : "false") +
-                 ",\"legacy\":" + (r.legacy ? "true" : "false") +
-                 ",\"bootloader\":" + (r.inBootloader ? "true" : "false") +
-                 ",\"interval\":" + String(r.setInterval) +
-                 ",\"age_s\":" + String((millis() - r.lastSeenMs) / 1000) + "}";
-      if (mqtt.publish(topic.c_str(), p.c_str())) { g_mqttPubCount++; g_mqttLastPubMs = now; }
+      // "Today so far" (consumption/export/cost/earnings) and the current tariff zone/rate -- the same
+      // numbers the History page's own KPIs show, computed here so HA gets them without a browser. Both
+      // need a synced clock; today's stats also need a same-day "start of day" baseline (see haveStart in
+      // DailyState/beginDay()) that a reader can lack for a while right after its very first observation.
+      bool tv = timeValid();
+      time_t tnow = tv ? time(nullptr) : 0;
+      float todayWh = 0, todayExpWh = 0, todayCostEur = 0, todayEarnEur = 0;
+      bool haveToday = tv && readerTodayStats(i, r, todayWh, todayExpWh, todayCostEur, todayEarnEur);
+      // Built into one fixed stack buffer via snprintf, NOT chained String concatenation -- this publish
+      // fires on every energy frame (as often as ~1/s for a live-interval reader), and this project has
+      // already been bitten once by heap fragmentation from exactly this kind of repeated small-String
+      // churn colliding with a concurrent GitHub-OTA download's own heap-hungry TLS handshake (confirmed
+      // live: a real OTA test failed with "couldn't start the flash write, 7072 B free heap" while this
+      // payload's earlier String-concatenation version was in place, publishing every second). A stack
+      // buffer costs zero heap and creates zero fragmentation, however often this runs.
+      char uuidBuf[42];
+      if (r.haveUuid) { String u = uuidStr(r.uuid); snprintf(uuidBuf, sizeof uuidBuf, "\"%s\"", u.c_str()); }
+      else strcpy(uuidBuf, "null");
+      char impBuf[12], expBuf[12], pwBuf[12], pwcBuf[12];
+      if (obi_na(r.import_))   strcpy(impBuf, "null"); else snprintf(impBuf, sizeof impBuf, "%lu", (unsigned long)r.import_);
+      if (obi_na(r.export_))   strcpy(expBuf, "null"); else snprintf(expBuf, sizeof expBuf, "%lu", (unsigned long)r.export_);
+      if (obi_na(r.power))     strcpy(pwBuf,  "null"); else snprintf(pwBuf,  sizeof pwBuf,  "%ld", (long)(int32_t)r.power);
+      if (obi_na(r.calcPower)) strcpy(pwcBuf, "null"); else snprintf(pwcBuf, sizeof pwcBuf, "%ld", (long)(int32_t)r.calcPower);
+      char todayWhBuf[12], todayExpBuf[12], todayCostBuf[16], todayEarnBuf[16], rateBuf[10];
+      if (haveToday) {
+        snprintf(todayWhBuf, sizeof todayWhBuf, "%lu", (unsigned long)todayWh);
+        snprintf(todayExpBuf, sizeof todayExpBuf, "%lu", (unsigned long)todayExpWh);
+        snprintf(todayCostBuf, sizeof todayCostBuf, "%.3f", (double)todayCostEur);
+        snprintf(todayEarnBuf, sizeof todayEarnBuf, "%.3f", (double)todayEarnEur);
+      } else {
+        strcpy(todayWhBuf, "null"); strcpy(todayExpBuf, "null");
+        strcpy(todayCostBuf, "null"); strcpy(todayEarnBuf, "null");
+      }
+      if (tv) snprintf(rateBuf, sizeof rateBuf, "%.2f", (double)tariffRateCentNow(r, tnow));
+      else    strcpy(rateBuf, "null");
+      char p[800];
+      int n = snprintf(p, sizeof p,
+        "{\"id\":\"%s\",\"uuid\":%s,\"type\":\"%s\",\"battery_mV\":%u,\"rssi\":%d,\"snr\":%.1f,"
+        "\"infrared\":%s,\"import\":%s,\"export\":%s,\"power\":%s,\"power_calc\":%s,"
+        "\"softver\":%u,\"hardver\":%u,\"paired\":%s,\"legacy\":%s,\"bootloader\":%s,"
+        "\"interval\":%u,\"age_s\":%lu,"
+        "\"today_wh\":%s,\"today_exp_wh\":%s,\"today_cost\":%s,\"today_earn\":%s,"
+        "\"tariff_mode\":%u,\"tariff_zone\":\"%s\",\"tariff_rate_cent\":%s,"
+        "\"day_wh\":%lu,\"night_wh\":%lu,\"ht_wh\":%lu,\"st_wh\":%lu,\"nt_wh\":%lu}",
+        id.c_str(), uuidBuf, typeName(r.devType), r.battery_mV, (int)r.lastRssi, (double)r.lastSnr,
+        (r.flags & 1) ? "true" : "false", impBuf, expBuf, pwBuf, pwcBuf,
+        r.softver, r.hardver, r.haveKey ? "true" : "false", r.legacy ? "true" : "false",
+        r.inBootloader ? "true" : "false",
+        r.setInterval, (unsigned long)((millis() - r.lastSeenMs) / 1000),
+        todayWhBuf, todayExpBuf, todayCostBuf, todayEarnBuf,
+        r.tariffMode, tv ? tariffZoneName(r, tnow) : "n/a", rateBuf,
+        (unsigned long)hDaily[i].dayWh, (unsigned long)hDaily[i].nightWh,
+        (unsigned long)hDaily[i].htWh, (unsigned long)hDaily[i].stWh, (unsigned long)hDaily[i].ntWh);
+      if (n > 0 && n < (int)sizeof p && mqtt.publish(topic.c_str(), p)) {
+        g_mqttPubCount++; g_mqttLastPubMs = now;
+      }
     }
   }
 }
