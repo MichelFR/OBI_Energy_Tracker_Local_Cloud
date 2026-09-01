@@ -3840,6 +3840,8 @@ header a{color:var(--accent);text-decoration:none;font-size:13px;white-space:now
 .langtog{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .langtog button{border:0;border-radius:0;padding:8px 10px;font-size:12px;font-weight:600;background:var(--panel2);color:var(--dim)}
 .langtog button.on{background:var(--accent2);color:#fff}
+#expTog{font-size:12px;font-weight:600;color:var(--dim)}
+#expTog.off{opacity:.55}
 .euro{color:var(--amber)}
 .chart{width:100%;height:auto;display:block;touch-action:pan-y}
 .legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:9px;font-size:12px;color:var(--dim)}
@@ -3885,6 +3887,7 @@ input[type=number]{font-size:14px;background:var(--panel2);color:var(--txt);bord
 <span class=sp></span>
 <span id=pbox class=pricebox>💶<input id=price type=number step=1 min=0><small>ct/kWh</small><span id=psaved></span></span>
 <span id=ebox class=pricebox>☀️<input id=eprice type=number step=1 min=0><small>ct/kWh</small><span id=esaved></span></span>
+<button id=expTog></button>
 <span id=fsstat class=dllabel></span>
 <a href="/">← dashboard</a>
 </header>
@@ -3941,7 +3944,9 @@ const T={
   rangeTip:'Zeitraum für Diagramme & Watt-Tabelle (max. 24 Std.)',
   thTime:'Zeit',thPow:'Leistung W',thPowCalc:'Ø Leistung W (berechnet)',thImpK:'Import kWh',thDelta:'Δ Import kWh',thExpK:'Export kWh',thDeltaExp:'Δ Export kWh',
   fewPts:'zu wenige Messpunkte für einen Verlauf',noDay:'noch keine Tageswerte — bitte etwas Zeit sammeln',
-  clearC:r=>'Gespeicherte Historie für '+r+' löschen?'},
+  clearC:r=>'Gespeicherte Historie für '+r+' löschen?',
+  expTogOn:'📤 Export sichtbar',expTogOff:'📤 Export ausgeblendet',
+  expTogT:'Export-/Einspeisungsansichten für diesen Reader ein-/ausblenden — nur die Anzeige auf diesem Gerät, ändert nichts an der Erfassung oder anderen Anzeigen (z. B. MQTT).'},
  en:{reload:'reload',dlLabel:'Export:',dlRawT:'Download raw samples as CSV',dlDailyT:'Download daily values as CSV',clearT:"clear this reader's history",fsFreeT:'Free space for all readers\' history data (see /debug for details)',fsRaw:'raw data',fsDaily:'daily values',priceT:'Electricity price – applies only to the currently selected reader',priceTexp:'Feed-in tariff – applies only to the currently selected reader',
   loading:'loading…',loadErr:'Failed to load.',
   noReaders:'No readers known yet.<br>As soon as a meter is received, its history appears here.',
@@ -3977,7 +3982,9 @@ const T={
   rangeTip:'Time range for charts & Watt table (max 24 h)',
   thTime:'Time',thPow:'Power W',thPowCalc:'Avg power W (calc)',thImpK:'Import kWh',thDelta:'Δ import kWh',thExpK:'Export kWh',thDeltaExp:'Δ export kWh',
   fewPts:'too few samples for a trend',noDay:'no daily values yet — please let it collect data',
-  clearC:r=>'Delete stored history for '+r+'?'}
+  clearC:r=>'Delete stored history for '+r+'?',
+  expTogOn:'📤 Export shown',expTogOff:'📤 Export hidden',
+  expTogT:"Show/hide export & feed-in views for this reader — only changes this device's display, not data collection or other views (e.g. MQTT)."}
 };
 const t=k=>T[lang][k];
 const loc=()=>numFmt===1?'de-DE':numFmt===2?'en-GB':(lang==='de'?'de-DE':'en-GB');
@@ -3990,9 +3997,20 @@ const dmy=ep=>{const d=D(ep);return lang==='de'?p2(d.getDate())+'.'+p2(d.getMont
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function applyLang(){document.documentElement.lang=lang;
  $('rf').title=t('reload');$('dllabel').textContent=t('dlLabel');$('dlraw').title=t('dlRawT');$('dldaily').title=t('dlDailyT');$('clr').title=t('clearT');$('pbox').title=t('priceT');$('ebox').title=t('priceTexp');
- $('rangebox').title=t('rangeTip');
- document.querySelectorAll('.langtog button').forEach(b=>b.classList.toggle('on',b.dataset.l===lang));}
+ $('rangebox').title=t('rangeTip');$('expTog').title=t('expTogT');
+ document.querySelectorAll('.langtog button').forEach(b=>b.classList.toggle('on',b.dataset.l===lang));
+ updateExpTog();}
 document.querySelectorAll('.langtog button').forEach(b=>b.onclick=()=>{lang=b.dataset.l;localStorage.setItem('obilang',lang);applyLang();if(cur)load();});
+// Purely a per-browser display preference for readers without feed-in (e.g. no PV) -- localStorage only, keyed
+// per reader so it travels with reader selection. Never touches the gateway: doesn't call any API, doesn't
+// affect data collection, MQTT, or any other page -- it only hides Export/feed-in KPIs, charts and table
+// columns on THIS page by folding into the existing anyExp gate that those already render behind (see load()).
+const expHideKey=id=>'obiHideExp_'+id;
+const isExpHidden=id=>!!id&&localStorage.getItem(expHideKey(id))==='1';
+function updateExpTog(){const h=isExpHidden(cur);$('expTog').textContent=t(h?'expTogOff':'expTogOn');$('expTog').classList.toggle('off',h);}
+$('expTog').onclick=()=>{if(!cur)return;
+ if(isExpHidden(cur))localStorage.removeItem(expHideKey(cur));else localStorage.setItem(expHideKey(cur),'1');
+ updateExpTog();load();};
 
 // ---- inline SVG line chart: series=[{name,color,pts:[[xEpoch,y]...]}] ----
 function lineChart(series,unit,zeroLine){
@@ -4136,6 +4154,7 @@ setInterval(()=>{if(cur&&!document.hidden&&document.activeElement!==$('price')&&
 
 async function load(silent){
  if(!cur)return;
+ updateExpTog();
  if(!silent)main.innerHTML='<div class=empty>'+t('loading')+'</div>';
  let h;try{h=await (await fetch('/api/history?id='+cur)).json();}catch(e){if(!silent)main.innerHTML='<div class=card><div class=empty>'+t('loadErr')+'</div></div>';return;}
  const S=h.samples||[],days=(h.daily||[]).map(d=>({ep:d[0],imp:d[1],exp:d[2],dayWh:d[3]||0,nightWh:d[4]||0,htWh:d[5]||0,stWh:d[6]||0,ntWh:d[7]||0}));
@@ -4187,7 +4206,10 @@ async function load(silent){
  // hours, which made the old sample-delta "today" far too small (e.g. 0.3 kWh instead of 3 kWh). The samples
  // are only a fallback for the very first day, before any previous daily row exists.
  const dayKey=ep=>{let d=D(ep);return d.getFullYear()+'-'+d.getMonth()+'-'+d.getDate();};
- let anyExp=S.some(s=>s[2]>0)||days.some(d=>d.exp>0);
+ // anyExp already gates every Export/feed-in KPI, chart and table column below -- folding the manual
+ // per-reader hide toggle in here (rather than threading it through each call site separately) makes it
+ // behave exactly like "this reader has no feed-in data", with zero effect on the underlying data/API calls.
+ let anyExp=(S.some(s=>s[2]>0)||days.some(d=>d.exp>0))&&!isExpHidden(cur);
  let today=null,todayExp=null,todayCost=null;
  if(days.length>=2&&dayKey(days[days.length-1].ep)===dayKey(h.now)){
   const base=days[days.length-2];                               // counter at the start of today (yesterday's close)
@@ -4200,7 +4222,7 @@ async function load(silent){
   if(td.length>=2){today=Math.max(0,(td[td.length-1][1]-td[0][1])/1000);todayExp=Math.max(0,(td[td.length-1][2]-td[0][2])/1000);todayCost=today*eur;}}
  html+='<div class=kpis>'+
   `<div class=kpi><div class=v>${nf(totImp,2)}</div><div class=l>${t('kImp')}</div></div>`+
-  `<div class=kpi><div class="v neg">${nf(totExp,2)}</div><div class=l>${t('kExp')}</div></div>`+
+  (isExpHidden(cur)?'':`<div class=kpi><div class="v neg">${nf(totExp,2)}</div><div class=l>${t('kExp')}</div></div>`)+
   `<div class=kpi><div class=v>${today==null?'—':nf(today,2)}</div><div class=l>${t('kToday')}</div></div>`+
   (eur>0?`<div class=kpi><div class="v euro">${todayCost==null?'—':nf(todayCost,2)+' €'}</div><div class=l>${t('kCost')(tariffMode===2?nf(htPrice,2)+'/'+nf(price,2)+'/'+nf(ntPrice,2):nightOn?nf(price,2)+'/'+nf(nightPrice,2):nf(price,2))}</div></div>`:'')+
   (anyExp?`<div class=kpi><div class="v neg">${todayExp==null?'—':nf(todayExp,2)}</div><div class=l>${t('kTodayExp')}</div></div>`:'')+
@@ -4250,7 +4272,7 @@ async function load(silent){
  let barsC=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.imp,vlab:eur>0?[fmtK(c.imp),nf(c.cost,2)+' €']:[fmtK(c.imp)]}));
  html+='<div class=card><h2>'+t('cDay')+'</h2><p class=cap>'+t('capDay')+'</p>'+barChart(barsC,'kWh',C.day)+'</div>';
  // feed-in per day (own chart + scale, only when there is any solar export) — € earnings line only when a feed-in tariff is set
- if(cons.some(c=>c.exp>0)){let barsE=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.exp,vlab:eeur>0?[fmtK(c.exp),nf(c.exp*eeur,2)+' €']:[fmtK(c.exp)]}));
+ if(anyExp&&cons.some(c=>c.exp>0)){let barsE=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.exp,vlab:eeur>0?[fmtK(c.exp),nf(c.exp*eeur,2)+' €']:[fmtK(c.exp)]}));
   html+='<div class=card><h2>'+t('cDayExp')+'</h2><p class=cap>'+t('capDayExp')+'</p>'+barChart(barsE,'kWh',C.exp)+'</div>';}
  // cumulative kWh — two separate charts, each with its own scale (export is far smaller than import,
  // so a shared axis would flatten it to the baseline). Import = grid draw (main value), Export = solar feed-in.
@@ -4304,8 +4326,9 @@ async function load(silent){
   for(let i=1;i<horder.length;i++){let a=hmap[horder[i-1]],b=hmap[horder[i]],dd=D(b.ep);
    hours.push({label:dm(b.ep)+' '+p2(dd.getHours())+':00',imp:Math.max(0,(b.imp-a.imp)/1000),exp:Math.max(0,(b.exp-a.exp)/1000)});}
   if(hours.length){
-   let rows=hours.slice(-48).reverse().map(x=>`<tr><td>${x.label}</td><td class="mono pos">${nf(x.imp,2)}</td><td class="mono neg">${anyExp?nf(x.exp,2):'—'}</td></tr>`).join('');
-   html+='<div class=card><h2>'+t('cHour')+'</h2><p class=cap>'+t('capHour')+'</p><div class=twrap><table><thead><tr><th>'+t('thHour')+'</th><th>'+t('thCons')+'</th><th>'+t('thExp')+'</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+   let head='<th>'+t('thHour')+'</th><th>'+t('thCons')+'</th>'+(anyExp?'<th>'+t('thExp')+'</th>':'');
+   let rows=hours.slice(-48).reverse().map(x=>`<tr><td>${x.label}</td><td class="mono pos">${nf(x.imp,2)}</td>`+(anyExp?`<td class="mono neg">${nf(x.exp,2)}</td>`:'')+`</tr>`).join('');
+   html+='<div class=card><h2>'+t('cHour')+'</h2><p class=cap>'+t('capHour')+'</p><div class=twrap><table><thead><tr>'+head+'</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   }
  }
  // watt / raw sample table
@@ -4316,8 +4339,9 @@ async function load(silent){
   let shown=all.filter(o=>o.s[0]>=rCutoff);   // same shared window as the charts above (header ⏱ select)
   let rows=shown.reverse().map(o=>{
    let s=o.s,pw=s[3]==null?'<span class=na>—</span>':nf(s[3],0);
-   return `<tr><td>${dmy(s[0])} ${hm(s[0])}</td><td class="mono">${pw}</td><td class="mono">${fmtW(o.cw)}</td><td class="mono">${nf(s[1]/1000,2)}</td><td class="mono">${fmtD(o.di)}</td><td class="mono">${nf(s[2]/1000,2)}</td><td class="mono">${fmtD(o.de)}</td></tr>`;}).join('');
-  html+='<div class=card><h2>'+t('cWatt')+'</h2><p class=cap>'+t('capWatt')+' ('+shown.length+'/'+all.length+')</p><div class=twrap><table><thead><tr><th>'+t('thTime')+'</th><th>'+t('thPow')+'</th><th>'+t('thPowCalc')+'</th><th>'+t('thImpK')+'</th><th>'+t('thDelta')+'</th><th>'+t('thExpK')+'</th><th>'+t('thDeltaExp')+'</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+   return `<tr><td>${dmy(s[0])} ${hm(s[0])}</td><td class="mono">${pw}</td><td class="mono">${fmtW(o.cw)}</td><td class="mono">${nf(s[1]/1000,2)}</td><td class="mono">${fmtD(o.di)}</td>`+
+    (anyExp?`<td class="mono">${nf(s[2]/1000,2)}</td><td class="mono">${fmtD(o.de)}</td>`:'')+`</tr>`;}).join('');
+  html+='<div class=card><h2>'+t('cWatt')+'</h2><p class=cap>'+t('capWatt')+' ('+shown.length+'/'+all.length+')</p><div class=twrap><table><thead><tr><th>'+t('thTime')+'</th><th>'+t('thPow')+'</th><th>'+t('thPowCalc')+'</th><th>'+t('thImpK')+'</th><th>'+t('thDelta')+'</th>'+(anyExp?'<th>'+t('thExpK')+'</th><th>'+t('thDeltaExp')+'</th>':'')+'</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
  }
  // day/night tariff settings for this reader -- deliberately the LAST section on the page (a settings
  // block, not something to read regularly like the charts/tables above). Base/export price lives in the
